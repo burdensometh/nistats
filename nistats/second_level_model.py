@@ -14,6 +14,7 @@ from warnings import warn
 
 import pandas as pd
 import numpy as np
+from numpy.linalg import matrix_rank
 
 from nibabel import Nifti1Image
 from nilearn._utils.niimg_conversions import check_niimg
@@ -26,11 +27,21 @@ from sklearn.externals.joblib import Memory
 
 from .first_level_model import FirstLevelModel
 from .first_level_model import run_glm
-from .regression import SimpleRegressionResults
-from .contrasts import compute_contrast, expression_to_contrast_vector
+from .regression import OLSModel, SimpleRegressionResults
+from .contrasts import (Contrast,
+                        compute_contrast,
+                        expression_to_contrast_vector,
+                        )
 from .utils import _basestring
 from .design_matrix import make_second_level_design_matrix
 from nistats._utils.helpers import replace_parameters
+
+
+#: Noise models accepted by SecondLevelModel
+#: 'ols' treats every image as an independent observation.
+#: 'cluster' aggregates residual scores within subject groups and uses a
+#: finite-sample-corrected cluster-robust covariance.
+_SECOND_LEVEL_NOISE_MODELS = ['ols', 'cluster']
 
 
 def _check_second_level_input(second_level_input, design_matrix,
@@ -130,7 +141,8 @@ def _check_confounds(confounds):
 
 
 def _check_first_level_contrast(second_level_input, first_level_contrast):
-    if isinstance(second_level_input[0], FirstLevelModel):
+    if isinstance(second_level_input, list) and isinstance(
+            second_level_input[0], FirstLevelModel):
         if first_level_contrast is None:
             raise ValueError('If second_level_input was a list of '
                              'FirstLevelModel, then first_level_contrast '
@@ -230,6 +242,182 @@ def _infer_effect_maps(second_level_input, contrast_def):
     return effect_maps
 
 
+def _check_design_estimability(design_matrix):
+    """Check that the design matrix has full column rank, i.e. that the
+    fixed effects are estimable. Raise otherwise.
+    """
+    X = np.asarray(design_matrix.values, dtype=np.float64)
+    eps = np.abs(X).sum() * np.finfo(np.float64).eps
+    rank = matrix_rank(X, eps)
+    if rank < X.shape[1]:
+        raise ValueError(
+            'The design matrix is not full rank (rank %i for %i columns), '
+            'so the fixed effects are not estimable. Remove collinear '
+            'regressors before fitting the second level model.'
+            % (rank, X.shape[1]))
+
+
+def _infer_subject_groups(second_level_input):
+    """Return one group label per image row, aligned with the effect maps
+    that ``_infer_effect_maps`` will produce.
+
+    A pandas DataFrame is sorted by subject_label in ``fit`` before the
+    model is stored, so its subject_label column is already aligned with
+    the image rows. A list of FirstLevelModel objects exposes one
+    ``subject_label`` per model.
+    """
+    if isinstance(second_level_input, pd.DataFrame):
+        groups = second_level_input['subject_label'].values
+    elif isinstance(second_level_input, list) and isinstance(
+            second_level_input[0], FirstLevelModel):
+        groups = np.asarray(
+            [model.subject_label for model in second_level_input])
+    else:
+        groups = None
+    return groups
+
+
+def _check_subject_groups(groups, n_rows, noise_model):
+    """Validate the subject grouping used by the cluster-robust model.
+
+    Ensures that group labels exist, are aligned with the image rows and
+    define enough independent groups for a finite-sample correction.
+    """
+    if noise_model != 'cluster':
+        return
+    if groups is None:
+        raise ValueError(
+            "noise_model='cluster' requires subject group labels. "
+            'Pass them through the groups argument of fit, or use a '
+            'second_level_input that carries subject labels '
+            '(pandas DataFrame or list of FirstLevelModel objects).')
+    groups = np.asarray(groups)
+    if groups.ndim != 1:
+        raise ValueError('groups must be a one-dimensional sequence of '
+                         'subject labels, got an array with %i dimensions'
+                         % groups.ndim)
+    if groups.shape[0] != n_rows:
+        raise ValueError(
+            'groups must contain one label per image row: %i labels '
+            'provided for %i image rows. Group labels must be aligned '
+            'with the rows of the design matrix and the effect maps.'
+            % (groups.shape[0], n_rows))
+    unique_groups, counts = np.unique(groups, return_counts=True)
+    n_groups = unique_groups.size
+    if n_groups < 2:
+        raise ValueError(
+            'A cluster-robust covariance requires at least two independent '
+            'subject groups to estimate variability; got %i group. Repeated '
+            'measurements within a single subject do not provide any '
+            'between-subject information.' % n_groups)
+    if np.any(counts == 0):
+        # np.unique never returns absent labels, this is defensive
+        raise ValueError('groups contains empty groups')
+    return groups, unique_groups
+
+
+def _cluster_design_quantities(X, groups):
+    """Pre-compute the fixed-design quantities shared by every voxel for
+    the finite-sample-corrected cluster-robust (CR2) covariance.
+
+    Parameters
+    ----------
+    X : array of shape (n_observations, n_regressors)
+        The fixed effects design matrix, assumed full column rank.
+
+    groups : array of shape (n_observations,)
+        Subject group label of each image row.
+
+    Returns
+    -------
+    cluster_info : list of dict
+        One entry per unique group with keys:
+        'indices': row indices of the group,
+        'adjustment': array of shape (n_g, n_g), the symmetric inverse
+        square root of (I_g - X_g (X'X)^-1 X_g'), the cluster leverage
+        adjustment used in the CR2 correction.
+
+    bread : array of shape (p, p)
+        (X'X)^-1, the OLS "bread" matrix.
+
+    References
+    ----------
+    Bell, R. M. and McCaffrey, D. F. (2002). Bias reduction in standard
+    errors for linear regression with multiple-stage samples. Survey
+    Methodology, 28(2), 169-181.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    xtx_inv = np.linalg.inv(np.dot(X.T, X))
+    unique_groups = np.unique(groups)
+    cluster_info = []
+    for group in unique_groups:
+        indices = np.where(groups == group)[0]
+        x_g = X[indices]
+        # Cluster hat matrix block H_gg = X_g (X'X)^-1 X_g'
+        hat_g = np.dot(x_g, np.dot(xtx_inv, x_g.T))
+        # I_g - H_gg is symmetric; symmetrize to kill rounding asymmetry
+        adjustment_matrix = np.eye(indices.size) - hat_g
+        adjustment_matrix = (adjustment_matrix + adjustment_matrix.T) / 2.
+        # Eigen-decomposition based symmetric inverse square root,
+        # robust against tiny negative eigenvalues
+        eigenvalues, eigenvectors = np.linalg.eigh(adjustment_matrix)
+        eigenvalues = np.maximum(eigenvalues,
+                                 np.finfo(np.float64).eps)
+        adjustment = np.dot(
+            eigenvectors,
+            np.dot(np.diag(1. / np.sqrt(eigenvalues)), eigenvectors.T))
+        cluster_info.append({'indices': indices, 'adjustment': adjustment})
+    return cluster_info, xtx_inv
+
+
+def _cluster_robust_contrast_variance(Y, X, beta, con_val, cluster_info,
+                                      xtx_inv):
+    """CR2 cluster-robust variance of a single-row t contrast, voxelwise.
+
+    The OLS point estimates ``beta`` are kept (the fixed effects design is
+    fitted unchanged). Residual score vectors X_i' e_i are summed within
+    each subject group, corrected with the finite-sample leverage
+    adjustment, and combined in a sandwich covariance. The contrast
+    variance c' V c is returned directly to avoid storing a full
+    (p, p, n_voxels) matrix.
+
+    Parameters
+    ----------
+    Y : array of shape (n_observations, n_voxels)
+        Masked effect maps.
+
+    X : array of shape (n_observations, n_regressors)
+        Design matrix.
+
+    beta : array of shape (n_regressors, n_voxels)
+        OLS coefficient estimates.
+
+    con_val : array of shape (n_regressors,)
+        Single t contrast vector.
+
+    cluster_info, xtx_inv : outputs of ``_cluster_design_quantities``
+
+    Returns
+    -------
+    variance : array of shape (n_voxels,)
+        CR2 cluster-robust estimate of Var(c' beta) at each voxel.
+    """
+    residuals = Y - np.dot(X, beta)
+    meat = 0.
+    for info in cluster_info:
+        indices = info['indices']
+        # CR2-corrected residual score of the group:
+        # X_g' (I_g - H_gg)^(-1/2) e_g
+        adjusted_residuals = np.dot(info['adjustment'],
+                                    residuals[indices])
+        score_g = np.dot(X[indices].T, adjusted_residuals)
+        # accumulate score_g score_g' on the contrast metric, without
+        # building the (p, p, n_voxels) sandwich matrix
+        weighted_score = np.dot(con_val, np.dot(xtx_inv, score_g))
+        meat += weighted_score ** 2
+    return meat
+
+
 class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
     """ Implementation of the General Linear Model for multiple subject
     fMRI data
@@ -271,12 +459,35 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         further inspection of model details. This has an important impact
         on memory consumption. True by default.
 
+    noise_model : {'ols', 'cluster'}, optional
+        Variance model used when computing contrasts.
+
+        If 'ols' (default), every image row is treated as an independent
+        observation, as in a standard ordinary least squares second level
+        GLM. This is anti-conservative when a subject contributes several
+        repeated measurement images, because the within-subject
+        observations are correlated.
+
+        If 'cluster', a cluster-robust covariance is used: the fixed
+        effects design is still fitted with OLS, but residual score
+        vectors (X_i' e_i) are summed within the subject groups given by
+        the ``groups`` argument of ``fit`` and combined into a sandwich
+        covariance with the CR2 finite-sample correction (Bell and
+        McCaffrey, 2002). Contrast statistics then follow a Student t
+        distribution with G - 1 degrees of freedom, where G is the number
+        of independent subject groups, instead of n - p.
+
     """
 
     @replace_parameters({'mask': 'mask_img'}, end_version='next')
     def __init__(self, mask_img=None, smoothing_fwhm=None,
                  memory=Memory(None), memory_level=1, verbose=0,
-                 n_jobs=1, minimize_memory=True):
+                 n_jobs=1, minimize_memory=True, noise_model='ols'):
+        if noise_model not in _SECOND_LEVEL_NOISE_MODELS:
+            raise ValueError(
+                'Acceptable noise models are {0}. You provided '
+                "'noise_model={1}'".format(_SECOND_LEVEL_NOISE_MODELS,
+                                           noise_model))
         self.mask_img = mask_img
         self.smoothing_fwhm = smoothing_fwhm
         if isinstance(memory, _basestring):
@@ -287,10 +498,17 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         self.verbose = verbose
         self.n_jobs = n_jobs
         self.minimize_memory = minimize_memory
+        self.noise_model = noise_model
         self.second_level_input_ = None
         self.confounds_ = None
+        self.groups_ = None
+        self.n_groups_ = None
+        self.df_residuals_ = None
+        self._cluster_info = None
+        self._xtx_inv = None
 
-    def fit(self, second_level_input, confounds=None, design_matrix=None):
+    def fit(self, second_level_input, confounds=None, design_matrix=None,
+            groups=None):
         """ Fit the second-level GLM
 
         1. create design matrix
@@ -334,6 +552,16 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             from second_level_input.
             Ensure that the order of maps given by a second_level_input
             list of Niimgs matches the order of the rows in the design matrix.
+
+        groups : array-like of shape (n_images,), optional
+            Subject label of each image row, used only when
+            ``noise_model='cluster'``. Repeated measurements of the same
+            subject must carry the same label. The labels must be aligned
+            with the rows of the design matrix and with the effect maps.
+            If None, labels are inferred from the ``subject_label`` column
+            of a pandas DataFrame input or from the ``subject_label``
+            attribute of FirstLevelModel inputs; for a plain list of
+            Niimg-like objects, ``groups`` is mandatory in cluster mode.
 
         """
         # check second_level_input
@@ -389,6 +617,29 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
                                                             confounds)
         self.design_matrix_ = design_matrix
 
+        # A cluster-robust fit is only meaningful on an estimable design;
+        # check rank explicitly instead of silently relying on the
+        # pseudoinverse, which would hide collinear fixed effects.
+        if self.noise_model == 'cluster':
+            _check_design_estimability(design_matrix)
+            if groups is None:
+                groups = _infer_subject_groups(second_level_input)
+            groups, unique_groups = _check_subject_groups(
+                groups, design_matrix.shape[0], self.noise_model)
+            self.groups_ = groups
+            self.n_groups_ = unique_groups.size
+            # Degrees of freedom follow the declared independent-group
+            # rule: G independent clusters -> G - 1 residual dof
+            self.df_residuals_ = self.n_groups_ - 1
+            self._cluster_info, self._xtx_inv = \
+                _cluster_design_quantities(design_matrix.values, groups)
+        else:
+            self.groups_ = None
+            self.n_groups_ = None
+            self.df_residuals_ = None
+            self._cluster_info = None
+            self._xtx_inv = None
+
         # Learn the mask. Assume the first level imgs have been masked.
         if not isinstance(self.mask_img, NiftiMasker):
             self.masker_ = NiftiMasker(
@@ -443,7 +694,8 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             It has to be a 't' contrast.
 
         second_level_stat_type: {'t', 'F'}, optional
-            Type of the second level contrast
+            Type of the second level contrast. F contrasts are not
+            available with ``noise_model='cluster'``.
 
         output_type: str, optional
             Type of the output map. Can be 'z_score', 'stat', 'p_value',
@@ -481,27 +733,76 @@ class SecondLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
 
         # Fit an Ordinary Least Squares regression for parametric statistics
         Y = self.masker_.transform(effect_maps)
-        if self.memory:
-            mem_glm = self.memory.cache(run_glm, ignore=['n_jobs'])
-        else:
-            mem_glm = run_glm
-        labels, results = mem_glm(Y, self.design_matrix_.values,
-                                  n_jobs=self.n_jobs, noise_model='ols')
+        X = self.design_matrix_.values
 
-        # We save memory if inspecting model details is not necessary
-        if self.minimize_memory:
-            for key in results:
-                results[key] = SimpleRegressionResults(results[key])
-        self.labels_ = labels
-        self.results_ = results
+        if self.noise_model == 'cluster':
+            # The cluster-robust model keeps the OLS point estimates and
+            # replaces only the covariance: residual scores are aggregated
+            # by subject and corrected for finite samples (CR2).
+            if second_level_stat_type == 'F':
+                raise ValueError(
+                    "F contrasts are not available with "
+                    "noise_model='cluster': the cluster-robust covariance "
+                    "supports t contrasts only.")
+            con_val = np.atleast_1d(np.asarray(con_val, dtype=np.float64))
+            if con_val.ndim != 1:
+                raise ValueError(
+                    "noise_model='cluster' supports one-dimensional t "
+                    'contrasts only')
+            # Re-derive group labels aligned with the image rows actually
+            # selected for this contrast (a DataFrame may hold several
+            # maps per subject, filtered by first_level_contrast)
+            if isinstance(self.second_level_input_, pd.DataFrame):
+                selected_rows = (self.second_level_input_['map_name']
+                                 == first_level_contrast)
+                groups = self.second_level_input_[selected_rows][
+                    'subject_label'].values
+            else:
+                groups = self.groups_
+            # Re-check alignment and enough independent groups against the
+            # actual effect maps used here
+            groups, unique_groups = _check_subject_groups(
+                groups, Y.shape[0], self.noise_model)
+            # Recompute the fixed-design quantities against the actual
+            # rows of this contrast, so they stay aligned even when the
+            # input contains several maps per subject
+            cluster_info, xtx_inv = _cluster_design_quantities(X, groups)
+            df_residuals = unique_groups.size - 1
 
-        # We compute contrast object
-        if self.memory:
-            mem_contrast = self.memory.cache(compute_contrast)
+            ols_fit = OLSModel(X).fit(Y)
+            self.labels_ = np.zeros(Y.shape[1])
+            self.results_ = {0.0: ols_fit}
+            beta = ols_fit.theta
+            effect = np.dot(con_val, beta)
+            variance = _cluster_robust_contrast_variance(
+                Y, X, beta, con_val, cluster_info, xtx_inv)
+            # Native t contrast with the declared independent-group dof
+            contrast = Contrast(effect=effect[np.newaxis],
+                                variance=variance,
+                                dim=1, dof=df_residuals,
+                                contrast_type='t')
         else:
-            mem_contrast = compute_contrast
-        contrast = mem_contrast(self.labels_, self.results_, con_val,
-                                second_level_stat_type)
+            if self.memory:
+                mem_glm = self.memory.cache(run_glm, ignore=['n_jobs'])
+            else:
+                mem_glm = run_glm
+            labels, results = mem_glm(Y, X,
+                                      n_jobs=self.n_jobs, noise_model='ols')
+
+            # We save memory if inspecting model details is not necessary
+            if self.minimize_memory:
+                for key in results:
+                    results[key] = SimpleRegressionResults(results[key])
+            self.labels_ = labels
+            self.results_ = results
+
+            # We compute contrast object
+            if self.memory:
+                mem_contrast = self.memory.cache(compute_contrast)
+            else:
+                mem_contrast = compute_contrast
+            contrast = mem_contrast(self.labels_, self.results_, con_val,
+                                    second_level_stat_type)
 
         output_types = \
             valid_types[:-1] if output_type == 'all' else [output_type]

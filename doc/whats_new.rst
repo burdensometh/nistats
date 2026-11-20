@@ -9,6 +9,21 @@
 	| It will be available as part of Nilearn 0.7.0.
 	| All future development will be done in Nilearn.
 
+New
+---
+
+* :class:`nistats.second_level_model.SecondLevelModel` accepts a
+  ``noise_model='cluster'`` option for repeated measurements of the same
+  subjects. Subject groups are passed through the new ``groups`` argument
+  of ``fit`` (or inferred from the ``subject_label`` column/attribute).
+  The fixed effects design is still fitted with OLS, while the covariance
+  is a cluster-robust sandwich with the CR2 finite-sample correction:
+  residual score vectors are summed within subjects and t contrasts use
+  G - 1 degrees of freedom, where G is the number of independent subject
+  groups. Fitting raises if fewer than two groups are provided, if the
+  group labels do not align with the image rows, or if the design is not
+  full rank.
+
 
 0.1.0b2
 =======
