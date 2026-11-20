@@ -169,6 +169,56 @@ def test_sample_condition_5():
     assert reg[61] == 5.
 
 
+def test_sample_condition_translation_invariance():
+    """ Test that shifting both the frame times and the event onsets by a
+    constant shifts the high-resolution time grid by the same constant and
+    leaves the sampled regressor unchanged.
+    """
+    condition = ([1.234, 20.678, 36.55], [2, 2, 2], [1, 1, 1])
+    frame_times = np.linspace(0, 49, 50)
+    reg, rf = _sample_condition(condition, frame_times, oversampling=10,
+                                min_onset=0)
+    shift = 100.
+    shifted_condition = ([1.234 + shift, 20.678 + shift, 36.55 + shift],
+                         [2, 2, 2], [1, 1, 1])
+    reg_s, rf_s = _sample_condition(shifted_condition, frame_times + shift,
+                                    oversampling=10, min_onset=0)
+    assert_almost_equal(rf_s - shift, rf)
+    assert_almost_equal(reg_s, reg)
+
+
+def test_compute_regressor_translation_invariance():
+    """ Test that the convolved regressor does not depend on the absolute
+    origin of time: shifting frame_times and onsets by the same constant
+    must not change the regressor values.
+    """
+    condition = ([1.234, 20.678, 36.55], [2, 2, 2], [1, 1, 1])
+    frame_times = np.linspace(0, 69, 70)
+    shift = 100.
+    shifted_condition = ([1.234 + shift, 20.678 + shift, 36.55 + shift],
+                         [2, 2, 2], [1, 1, 1])
+    reg, reg_names = compute_regressor(condition, 'spm', frame_times)
+    reg_s, reg_names_s = compute_regressor(shifted_condition, 'spm',
+                                           frame_times + shift)
+    assert_almost_equal(reg_s, reg)
+    assert reg_names == reg_names_s
+
+
+def test_compute_regressor_irregular_frame_times():
+    """ Test that with non-uniformly sampled frame times, the events are
+    sampled at the true acquisition times.
+    """
+    condition = ([10.], [2.], [1.])
+    frame_times = np.array([0.5, 1.0, 2.3, 3.9, 4.5, 6.1, 7.7, 8.9, 9.6,
+                            10.4, 11.2, 12.6, 14.2, 15.8, 17.0])
+    # no hrf: the regressor is the event indicator sampled at frame_times
+    reg, _ = compute_regressor(condition, None, frame_times, min_onset=0)
+    reg = reg.ravel()
+    inside = (frame_times >= 10.) & (frame_times < 12.)
+    assert_almost_equal(reg[inside], 1.)
+    assert_almost_equal(reg[~inside], 0.)
+
+
 def test_names():
     """ Test the regressor naming function
     """

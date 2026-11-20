@@ -354,6 +354,107 @@ def test_first_level_model_design_creation():
         del FUNCFILE, mask, model, func_img
 
 
+def test_first_level_model_frame_times():
+    # frame_times can be provided directly instead of t_r
+    with InTemporaryDirectory():
+        shapes = ((7, 8, 9, 10),)
+        mask, FUNCFILE, _ = _write_fake_fmri_data(shapes)
+        FUNCFILE = FUNCFILE[0]
+        func_img = load(FUNCFILE)
+        n_scans = func_img.shape[-1]
+        events = basic_paradigm()
+        # model with design computed from t_r and slice_time_ref
+        t_r = 10.0
+        slice_time_ref = .5
+        model = FirstLevelModel(t_r, slice_time_ref, mask_img=mask,
+                                drift_model='polynomial', drift_order=3)
+        model.fit(func_img, events)
+        X1 = model.design_matrices_[0]
+        # model with the equivalent frame_times given directly, no t_r
+        start_time = slice_time_ref * t_r
+        end_time = (n_scans - 1 + slice_time_ref) * t_r
+        frame_times = np.linspace(start_time, end_time, n_scans)
+        model2 = FirstLevelModel(mask_img=mask, drift_model='polynomial',
+                                 drift_order=3)
+        model2.fit(func_img, events, frame_times=frame_times)
+        X2 = model2.design_matrices_[0]
+        assert_array_equal(X1.columns, X2.columns)
+        assert_almost_equal(X1.values, X2.values)
+        assert_array_equal(np.asarray(X2.index), frame_times)
+        # per-run frame_times: runs may start at different times.
+        # shifting the frame times and the event onsets of a run by the
+        # same constant must not change its design matrix
+        shift = 7.
+        shifted_events = events.copy()
+        shifted_events['onset'] += shift
+        model3 = FirstLevelModel(mask_img=mask, drift_model='polynomial',
+                                 drift_order=3)
+        model3.fit([func_img, func_img], [events, shifted_events],
+                   frame_times=[frame_times, frame_times + shift])
+        assert len(model3.design_matrices_) == 2
+        assert_almost_equal(model3.design_matrices_[0].values,
+                            model3.design_matrices_[1].values)
+        # Delete objects attached to files to avoid WindowsError when
+        # deleting temporary directory (in Windows)
+        del FUNCFILE, mask, model, model2, model3, func_img
+
+
+def test_first_level_model_frame_times_errors():
+    # invalid frame_times are rejected
+    with InTemporaryDirectory():
+        shapes = ((7, 8, 9, 10),)
+        mask, FUNCFILE, _ = _write_fake_fmri_data(shapes)
+        func_img = load(FUNCFILE[0])
+        n_scans = func_img.shape[-1]
+        events = basic_paradigm()
+        frame_times = np.linspace(0, 90, n_scans)
+        # length does not match the number of scans
+        with pytest.raises(ValueError):
+            FirstLevelModel(mask_img=mask).fit(
+                func_img, events, frame_times=frame_times[:-1])
+        # not strictly increasing
+        bad_frame_times = frame_times.copy()
+        bad_frame_times[3] = bad_frame_times[2]
+        with pytest.raises(ValueError):
+            FirstLevelModel(mask_img=mask).fit(
+                func_img, events, frame_times=bad_frame_times)
+        # one timing vector per run is expected
+        with pytest.raises(ValueError):
+            FirstLevelModel(mask_img=mask).fit(
+                [func_img, func_img], [events, events],
+                frame_times=[frame_times])
+        del func_img, mask, FUNCFILE, _
+
+
+def test_first_level_model_irregular_frame_times_noise_model():
+    # non-uniformly sampled frame_times: the ar1 noise model is refused,
+    # while ols can be used
+    with InTemporaryDirectory():
+        shapes = ((7, 8, 9, 10),)
+        mask, FUNCFILE, _ = _write_fake_fmri_data(shapes)
+        func_img = load(FUNCFILE[0])
+        n_scans = func_img.shape[-1]
+        events = pd.DataFrame({'trial_type': ['c0', 'c0'],
+                               'onset': [2., 8.],
+                               'duration': [1., 1.]})
+        frame_times = np.array([0., 1.5, 3., 5., 6.5, 8., 10., 11.5, 13.,
+                                15.])
+        assert len(frame_times) == n_scans
+        # ar1 assumes regularly sampled data
+        with pytest.raises(ValueError):
+            FirstLevelModel(mask_img=mask, noise_model='ar1').fit(
+                func_img, events, frame_times=frame_times)
+        # ols can be used with non-uniform sampling
+        model = FirstLevelModel(mask_img=mask, noise_model='ols')
+        model.fit(func_img, events, frame_times=frame_times)
+        assert model.design_matrices_[0].shape[0] == n_scans
+        # uniformly spaced frame_times keep ar1 available
+        model = FirstLevelModel(mask_img=mask, noise_model='ar1')
+        model.fit(func_img, events,
+                  frame_times=np.linspace(0, 15, n_scans))
+        del func_img, mask, FUNCFILE, _
+
+
 def test_first_level_model_glm_computation():
     with InTemporaryDirectory():
         shapes = ((7, 8, 9, 10),)

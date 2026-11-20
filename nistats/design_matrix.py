@@ -51,6 +51,34 @@ from .utils import full_rank, _basestring
 ######################################################################
 
 
+def _check_frame_times(frame_times):
+    """Check that the provided frame_times are valid for design matrix
+    creation, and return them as a one-dimensional float array.
+
+    Parameters
+    ----------
+    frame_times : array of shape (n_frames,)
+        The timing of acquisition of the scans in seconds.
+
+    Returns
+    -------
+    frame_times : array of shape (n_frames,), dtype=float
+        The input frame_times, converted to a float array.
+
+    """
+    frame_times = np.asarray(frame_times, dtype=np.float)
+    if frame_times.ndim != 1:
+        raise ValueError('frame_times should be a one-dimensional array, '
+                         'got an array with %d dimensions'
+                         % frame_times.ndim)
+    if frame_times.size < 2:
+        raise ValueError('frame_times should contain at least two time '
+                         'points, got %d' % frame_times.size)
+    if (np.diff(frame_times) <= 0).any():
+        raise ValueError('frame_times should be strictly increasing')
+    return frame_times
+
+
 def _poly_drift(order, frame_times):
     """Create a polynomial drift matrix
 
@@ -69,9 +97,14 @@ def _poly_drift(order, frame_times):
     """
     order = int(order)
     pol = np.zeros((np.size(frame_times), order + 1))
+    # Normalize the time axis to [0, 1] over the run, so that the drift
+    # regressors do not change when all time stamps are shifted by a
+    # constant (translation invariance).
+    tmin = float(frame_times.min())
     tmax = float(frame_times.max())
+    normalized_times = (frame_times - tmin) / (tmax - tmin)
     for k in range(order + 1):
-        pol[:, k] = (frame_times / tmax) ** k
+        pol[:, k] = normalized_times ** k
     pol = _orthogonalize(pol)
     pol = np.hstack((pol[:, 1:], pol[:, :1]))
     return pol
@@ -95,10 +128,17 @@ def _cosine_drift(high_pass, frame_times):
         Cosine drifts plus a constant regressor at cosine_drift[:, -1]
 
     Ref: http://en.wikipedia.org/wiki/Discrete_cosine_transform DCT-II
+
+    Note: for non-uniformly sampled frame_times, the cosines are
+    evaluated at the true acquisition times, using the mean sampling
+    interval as reference.
     """
     n_frames = len(frame_times)
-    n_times = np.arange(n_frames)
+    # mean sampling interval over the run
     dt = (frame_times[-1] - frame_times[0]) / (n_frames - 1)
+    # effective scan index of each frame; relative to the first frame,
+    # so that the drift does not depend on the origin of time
+    n_times = (frame_times - frame_times[0]) / dt
     if high_pass * dt >= .5:
         warn('High-pass filter will span all accessible frequencies '
              'and saturate the design matrix. '
@@ -252,6 +292,9 @@ def make_first_level_design_matrix(
     ----------
     frame_times : array of shape (n_frames,)
         The timing of acquisition of the scans in seconds.
+        Must be strictly increasing; non-uniform sampling intervals are
+        supported, in which case event convolution and drift regressors
+        are evaluated at the true acquisition times.
 
     events : DataFrame instance, optional
         Events data that describes the experimental paradigm.
@@ -316,6 +359,8 @@ def make_first_level_design_matrix(
         and each column a regressor.
     """
     # check arguments
+    # check that the frame times are usable
+    frame_times = _check_frame_times(frame_times)
     # check that additional regressor specification is correct
     n_add_regs = 0
     if add_regs is not None:

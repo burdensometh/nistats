@@ -262,12 +262,19 @@ def _sample_condition(exp_condition, frame_times, oversampling=50,
     # Find the high-resolution frame_times
     n = frame_times.size
     min_onset = float(min_onset)
-    n_hr = ((n - 1) * 1. / (frame_times.max() - frame_times.min())
-            * (frame_times.max() * (1 + 1. / (n - 1)) - frame_times.min()
-               - min_onset) * oversampling) + 1
+    # Mean sampling interval of the run. frame_times may not start at 0
+    # and may be non-uniformly sampled, so the interval is derived from
+    # the run duration rather than from the absolute time stamps.
+    tr = (frame_times.max() - frame_times.min()) / (n - 1)
+    # The high-resolution grid covers the run plus one extra sampling
+    # interval, to accommodate the tail of the hrf after the last frame.
+    # Both its bounds are relative to frame_times.min(), so that shifting
+    # all time stamps by a constant shifts the grid by the same constant.
+    n_hr = ((frame_times.max() + tr - frame_times.min() - min_onset)
+            / tr * oversampling) + 1
 
     hr_frame_times = np.linspace(frame_times.min() + min_onset,
-                                 frame_times.max() * (1 + 1. / (n - 1)),
+                                 frame_times.max() + tr,
                                  np.rint(n_hr).astype(np.int))
 
     # Get the condition information
@@ -498,8 +505,13 @@ def compute_regressor(exp_condition, hrf_model, frame_times, con_id='cond',
         fir_delays = [int(x) for x in fir_delays]
     oversampling = int(oversampling)
 
-    # this is the average tr in this session, not necessarily the true tr
-    tr = float(frame_times.max()) / (np.size(frame_times) - 1)
+    # this is the average tr in this session, not necessarily the true tr.
+    # frame_times may not start at 0 and may be non-uniformly sampled, so
+    # the average is taken over the run duration; using
+    # frame_times.max() / (n_scans - 1) here would mistake the absolute
+    # time of the last frame for a sampling interval.
+    tr = ((float(frame_times.max()) - float(frame_times.min()))
+          / (np.size(frame_times) - 1))
 
     # 1. create the high temporal resolution regressor
     hr_regressor, hr_frame_times = _sample_condition(

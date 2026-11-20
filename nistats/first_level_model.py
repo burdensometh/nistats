@@ -34,7 +34,8 @@ from sklearn.externals.joblib import (Parallel,
 
 from .contrasts import (_compute_fixed_effect_contrast,
                         expression_to_contrast_vector)
-from .design_matrix import make_first_level_design_matrix
+from .design_matrix import (_check_frame_times,
+                            make_first_level_design_matrix)
 from .regression import (ARModel,
                          OLSModel,
                          SimpleRegressionResults,
@@ -174,6 +175,10 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         In seconds. It is necessary to correctly consider times in the design
         matrix. This parameter is also passed to nilearn.signal.clean.
         Please see the related documentation for details.
+        It is only needed to derive the frame times of the design matrix;
+        the acquisition times of each run can also be given directly
+        through the `frame_times` parameter of the `fit` method, e.g.
+        when the sampling is not regular.
 
     slice_time_ref : float, optional (default 0.)
         This parameter indicates the time of the reference slice used in the
@@ -335,7 +340,7 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         self.subject_label = subject_label
 
     def fit(self, run_imgs, events=None, confounds=None,
-            design_matrices=None):
+            design_matrices=None, frame_times=None):
         """ Fit the GLM
 
         For each run:
@@ -370,6 +375,19 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             Design matrices that will be used to fit the GLM. If given it
             takes precedence over events and confounds.
 
+        frame_times: array of shape (n_scans,) or list of such arrays,\
+            optional
+            The acquisition times of the scans of each run, in seconds.
+            Give one array per run_img when the runs have different
+            sampling intervals or start times. If None, the frame times
+            are computed from t_r and slice_time_ref. The times of each
+            run must be strictly increasing and match the number of
+            scans of the run. Non-uniformly sampled frame_times are
+            supported, but note that the 'ar1' noise model assumes
+            regularly sampled data: with non-uniform frame_times, use
+            noise_model='ols'. Ignored in case design_matrices is
+            not None.
+
         """
         # Check arguments
         # Check imgs type
@@ -380,9 +398,10 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         if design_matrices is None:
             if events is None:
                 raise ValueError('events or design matrices must be provided')
-            if self.t_r is None:
+            if self.t_r is None and frame_times is None:
                 raise ValueError('t_r not given to FirstLevelModel object'
-                                 ' to compute design from events')
+                                 ' and frame_times not provided to fit:'
+                                 ' cannot compute design from events')
         else:
             design_matrices = _check_run_tables(run_imgs, design_matrices,
                                                 'design_matrices')
@@ -392,6 +411,31 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             events = _check_run_tables(run_imgs, events, 'events')
         if confounds is not None:
             confounds = _check_run_tables(run_imgs, confounds, 'confounds')
+
+        # Check the user-provided acquisition times: one strictly
+        # increasing timing vector per run. Their length is checked
+        # against the number of scans of each run below.
+        if frame_times is not None and design_matrices is None:
+            if not isinstance(frame_times, (list, tuple)):
+                frame_times = [frame_times]
+            if len(frame_times) != len(run_imgs):
+                raise ValueError('frame_times must be given as a list of '
+                                 'arrays, one per run. Got %d timing '
+                                 'vectors for %d runs.'
+                                 % (len(frame_times), len(run_imgs)))
+            frame_times = [_check_frame_times(run_frame_times)
+                           for run_frame_times in frame_times]
+            if self.noise_model == 'ar1':
+                for run_idx, run_frame_times in enumerate(frame_times):
+                    sampling_intervals = np.diff(run_frame_times)
+                    if not np.allclose(sampling_intervals,
+                                       sampling_intervals[0]):
+                        raise ValueError(
+                            'frame_times of run at index %d are not '
+                            'uniformly spaced, but the ar1 noise model '
+                            'assumes regularly sampled data. Use '
+                            "noise_model='ols' or provide uniformly "
+                            'spaced frame_times.' % run_idx)
 
         # Learn the mask
         if self.mask_img is False:
@@ -464,10 +508,20 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
                 else:
                     confounds_matrix = None
                     confounds_names = None
-                start_time = self.slice_time_ref * self.t_r
-                end_time = (n_scans - 1 + self.slice_time_ref) * self.t_r
-                frame_times = np.linspace(start_time, end_time, n_scans)
-                design = make_first_level_design_matrix(frame_times,
+                if frame_times is None:
+                    start_time = self.slice_time_ref * self.t_r
+                    end_time = (n_scans - 1 + self.slice_time_ref) * self.t_r
+                    run_frame_times = np.linspace(start_time, end_time,
+                                                  n_scans)
+                else:
+                    run_frame_times = frame_times[run_idx]
+                    if run_frame_times.size != n_scans:
+                        raise ValueError(
+                            'frame_times of run at index %d contain %d '
+                            'time points, but the corresponding run image '
+                            'contains %d scans.'
+                            % (run_idx, run_frame_times.size, n_scans))
+                design = make_first_level_design_matrix(run_frame_times,
                                                         events[run_idx],
                                                         self.hrf_model,
                                                         self.drift_model,

@@ -16,8 +16,10 @@ import pytest
 from nibabel.tmpdirs import InTemporaryDirectory
 from numpy.testing import assert_almost_equal, assert_array_equal
 
-from nistats.design_matrix import (_convolve_regressors,
+from nistats.design_matrix import (_check_frame_times,
+                                   _convolve_regressors,
                                    _cosine_drift,
+                                   _poly_drift,
                                    check_design_matrix,
                                    make_first_level_design_matrix,
                                    make_second_level_design_matrix,
@@ -96,6 +98,76 @@ def test_cosine_drift():
     nistats_drifts = _cosine_drift(high_pass_frequency, frame_times)
     assert_almost_equal(spm_drifts[:, 1:], nistats_drifts[:, : -2])
     # nistats_drifts is placing the constant at the end [:, : - 1]
+
+
+def test_check_frame_times():
+    # valid frame times pass through as a float array
+    frame_times = _check_frame_times(np.arange(10))
+    assert frame_times.dtype == np.float
+    # not strictly increasing
+    with pytest.raises(ValueError, match='strictly increasing'):
+        _check_frame_times(np.array([0., 1., 1., 2.]))
+    with pytest.raises(ValueError, match='strictly increasing'):
+        _check_frame_times(np.array([2., 1., 0.]))
+    # too few time points
+    with pytest.raises(ValueError, match='at least two'):
+        _check_frame_times(np.array([0.]))
+    # not one-dimensional
+    with pytest.raises(ValueError, match='one-dimensional'):
+        _check_frame_times(np.zeros((3, 3)))
+
+
+def test_poly_drift_translation_invariance():
+    # polynomial drifts must not depend on the origin of time
+    frame_times = np.linspace(2., 50., 20)
+    drift = _poly_drift(3, frame_times)
+    drift_shifted = _poly_drift(3, frame_times + 100.)
+    assert_almost_equal(drift, drift_shifted)
+
+
+def test_cosine_drift_translation_invariance():
+    # cosine drifts must not depend on the origin of time, and are
+    # evaluated at the true acquisition times for non-uniform sampling
+    frame_times = np.array([0.5, 1.0, 2.3, 3.9, 4.5, 6.1, 7.7, 8.9, 9.6,
+                            10.4])
+    drift = _cosine_drift(.01, frame_times)
+    drift_shifted = _cosine_drift(.01, frame_times + 100.)
+    assert_almost_equal(drift, drift_shifted)
+    # the constant regressor is in the last column
+    assert_array_equal(drift[:, -1], np.ones(len(frame_times)))
+
+
+def test_design_matrix_translation_invariance():
+    # shifting both the frame times and the event onsets by a constant
+    # must not change the design matrix values
+    frame_times = np.linspace(0, 127, 128)
+    events = basic_paradigm()
+    shift = 37.
+    shifted_events = events.copy()
+    shifted_events['onset'] += shift
+    for drift_model in ('polynomial', 'cosine', None):
+        X1 = make_first_level_design_matrix(frame_times, events,
+                                            drift_model=drift_model)
+        X2 = make_first_level_design_matrix(frame_times + shift,
+                                            shifted_events,
+                                            drift_model=drift_model)
+        assert_almost_equal(X2.values, X1.values)
+
+
+def test_design_matrix_irregular_frame_times():
+    # with non-uniformly sampled frame times, events are convolved and
+    # sampled at the true acquisition times
+    events = pd.DataFrame({'trial_type': ['c0'],
+                           'onset': [10.],
+                           'duration': [2.]})
+    frame_times = np.array([0.5, 1.0, 2.3, 3.9, 4.5, 6.1, 7.7, 8.9, 9.6,
+                            10.4, 11.2, 12.6, 14.2, 15.8, 17.0])
+    X = make_first_level_design_matrix(frame_times, events, hrf_model=None,
+                                       drift_model=None, min_onset=0)
+    reg = X['c0'].values
+    inside = (frame_times >= 10.) & (frame_times < 12.)
+    assert_almost_equal(reg[inside], 1.)
+    assert_almost_equal(reg[~inside], 0.)
 
 
 def test_design_matrix0():
@@ -331,7 +403,11 @@ def test_design_matrix14():
                                    drift_model='polynomial', drift_order=3,
                                    fir_delays=range(1, 5))
     onset = events.onset[events.trial_type == 'c0'].astype(np.int)
-    assert np.all(X[onset + 1, 0] > .5)
+    # frame_times are now translated by half a tr relative to the events,
+    # so the delay-1 FIR regressor at frame onset + 1 (sampled at
+    # onset + 1.5 s) averages exactly half of the event window: the
+    # response is still captured at the frames following the onsets.
+    assert np.all(X[onset + 1, 0] >= .5)
 
 
 def test_design_matrix15():
