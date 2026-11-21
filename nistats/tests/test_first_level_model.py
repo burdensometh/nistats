@@ -29,6 +29,7 @@ from nistats.first_level_model import (first_level_models_from_bids,
                                        mean_scaling,
                                        run_glm,
                                        )
+from nistats.regression import SimpleRegressionResults
 from nistats.utils import get_bids_files, get_data
 from nistats._utils.testing import (_create_fake_bids_dataset,
                                     _generate_fake_fmri_data,
@@ -674,3 +675,171 @@ def test_first_level_model_predictions_r_square():
 
     r_square_2d = model.masker_.transform(r_square_3d)
     assert_array_less(0., r_square_2d)
+
+
+def test_first_level_model_block_wise_matches_standard():
+    """Block-wise fitting must give the same contrasts as the standard
+    path, for one or several runs, both noise models, t and F contrasts,
+    and whatever the block size.
+    """
+    shapes, rk = ((7, 8, 9, 15), (7, 8, 9, 16)), 3
+    mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes, rk)
+    n_voxels = int(get_data(mask).sum())
+
+    for noise_model in ['ols', 'ar1']:
+        standard = FirstLevelModel(mask_img=mask, noise_model=noise_model)
+        standard.fit(fmri_data, design_matrices=design_matrices)
+        # several blocks, and a single block holding the whole mask
+        for block_size in [64, n_voxels + 10]:
+            blocked = FirstLevelModel(mask_img=mask,
+                                      noise_model=noise_model,
+                                      block_size=block_size)
+            blocked.fit(fmri_data, design_matrices=design_matrices)
+            assert blocked.labels_ == []
+            assert blocked.results_ == []
+            assert len(blocked.block_results_) == 2
+            # the merged labels cover the whole mask, in mask order
+            labels, results = blocked._merge_block_results()
+            assert len(labels) == 2
+            for run_labels in labels:
+                assert run_labels.shape == (n_voxels,)
+            for con_val in [np.eye(rk)[1], np.eye(rk)[:2]]:
+                for output_type in ['z_score', 'stat', 'p_value',
+                                    'effect_size', 'effect_variance']:
+                    expected = standard.compute_contrast(
+                        con_val, output_type=output_type)
+                    blocked_out = blocked.compute_contrast(
+                        con_val, output_type=output_type)
+                    assert_array_almost_equal(get_data(expected),
+                                              get_data(blocked_out))
+    del mask, fmri_data, design_matrices, standard, blocked
+
+
+def test_first_level_model_block_wise_scaling():
+    """Signal scaling must be identical to the standard path."""
+    shapes, rk = [(7, 8, 9, 15)], 3
+    mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes, rk)
+
+    for signal_scaling in [False, 0, (0, 1)]:
+        standard = FirstLevelModel(mask_img=mask, noise_model='ols',
+                                   signal_scaling=signal_scaling)
+        standard.fit(fmri_data, design_matrices=design_matrices)
+        blocked = FirstLevelModel(mask_img=mask, noise_model='ols',
+                                  signal_scaling=signal_scaling,
+                                  block_size=64)
+        blocked.fit(fmri_data, design_matrices=design_matrices)
+        expected = standard.compute_contrast(np.eye(rk)[1],
+                                             output_type='effect_size')
+        blocked_out = blocked.compute_contrast(np.eye(rk)[1],
+                                               output_type='effect_size')
+        assert_array_almost_equal(get_data(expected), get_data(blocked_out))
+    del mask, fmri_data, design_matrices, standard, blocked
+
+
+def test_first_level_model_block_wise_with_smoothing():
+    """Smoothing is supported in block-wise fitting and matches the
+    standard path."""
+    shapes, rk = [(7, 8, 9, 15)], 3
+    mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes, rk)
+
+    standard = FirstLevelModel(mask_img=mask, smoothing_fwhm=4.,
+                               noise_model='ols')
+    standard.fit(fmri_data, design_matrices=design_matrices)
+    blocked = FirstLevelModel(mask_img=mask, smoothing_fwhm=4.,
+                              noise_model='ols', block_size=64)
+    blocked.fit(fmri_data, design_matrices=design_matrices)
+    expected = standard.compute_contrast(np.eye(rk)[0])
+    blocked_out = blocked.compute_contrast(np.eye(rk)[0])
+    assert_array_almost_equal(get_data(expected), get_data(blocked_out))
+    del mask, fmri_data, design_matrices, standard, blocked
+
+
+def test_first_level_model_block_wise_with_paths():
+    """Block-wise fitting works with proxy-backed images from files and
+    matches the standard path."""
+    shapes, rk = ((7, 8, 9, 15),), 3
+    with InTemporaryDirectory():
+        mask_file, fmri_files, design_files = _write_fake_fmri_data(shapes,
+                                                                    rk)
+        standard = FirstLevelModel(mask_img=None).fit(
+            fmri_files, design_matrices=design_files)
+        blocked = FirstLevelModel(mask_img=None, block_size=64).fit(
+            fmri_files, design_matrices=design_files)
+        expected = standard.compute_contrast(np.eye(rk)[1])
+        blocked_out = blocked.compute_contrast(np.eye(rk)[1])
+        assert_array_almost_equal(get_data(expected), get_data(blocked_out))
+        del mask_file, fmri_files, design_files, standard, blocked
+        del expected, blocked_out
+
+
+def test_first_level_model_block_wise_with_memory_caching():
+    """Block-wise fitting supports joblib caching of the extractions."""
+    shapes, rk = [(7, 8, 9, 10)], 3
+    with InTemporaryDirectory():
+        mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes,
+                                                                    rk)
+        blocked = FirstLevelModel(mask_img=mask, block_size=64,
+                                  memory='nistats_cache', memory_level=1)
+        blocked.fit(fmri_data, design_matrices=design_matrices)
+        z_image = blocked.compute_contrast(np.eye(rk)[0])
+        assert isinstance(z_image, Nifti1Image)
+        # a second fit reuses the cached block extractions and gives the
+        # same results
+        blocked.fit(fmri_data, design_matrices=design_matrices)
+        z_image_2 = blocked.compute_contrast(np.eye(rk)[0])
+        assert_array_almost_equal(get_data(z_image), get_data(z_image_2))
+        blocked.memory.clear()
+        del mask, fmri_data, design_matrices, blocked, z_image, z_image_2
+
+
+def test_first_level_model_block_wise_errors():
+    shapes, rk = [(7, 8, 9, 10)], 3
+    mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes, rk)
+
+    # invalid block_size values
+    for block_size in [0, -3, 1.5, '64', True]:
+        with pytest.raises(ValueError):
+            FirstLevelModel(block_size=block_size)
+    # signal_scaling=1 is not supported with block_size, as in the
+    # standard path
+    with pytest.raises(ValueError):
+        FirstLevelModel(block_size=64, signal_scaling=1)
+    # contrast computation before fit raises
+    model = FirstLevelModel(block_size=64)
+    with pytest.raises(ValueError):
+        model.compute_contrast(np.eye(rk)[0])
+    # block-wise fits always minimize memory: minimize_memory=False is
+    # ignored with a warning, and voxelwise attributes are not available
+    model = FirstLevelModel(mask_img=mask, block_size=64,
+                            minimize_memory=False)
+    with pytest.warns(UserWarning, match='minimize_memory'):
+        model.fit(fmri_data, design_matrices=design_matrices)
+    with pytest.raises(ValueError):
+        model.residuals
+    with pytest.raises(ValueError):
+        model.predicted
+    with pytest.raises(ValueError):
+        model.r_square
+    del mask, fmri_data, design_matrices, model
+
+
+def test_first_level_model_block_wise_block_structure():
+    """The per-block storage is bounded by block_size and minimized."""
+    shapes, rk = [(7, 8, 9, 10)], 3
+    mask, fmri_data, design_matrices = _generate_fake_fmri_data(shapes, rk)
+    n_voxels = int(get_data(mask).sum())
+    block_size = 64
+    model = FirstLevelModel(mask_img=mask, block_size=block_size)
+    model.fit(fmri_data, design_matrices=design_matrices)
+    run_blocks = model.block_results_[0]
+    n_blocks = int(np.ceil(n_voxels / float(block_size)))
+    assert len(run_blocks) == n_blocks
+    for block_labels, block_results in run_blocks:
+        assert block_labels.shape[0] <= block_size
+        # only minimized results are stored: no full residual matrix
+        for res in block_results.values():
+            assert isinstance(res, SimpleRegressionResults)
+    # the blocks partition the whole mask
+    assert sum(block_labels.shape[0]
+               for block_labels, _ in run_blocks) == n_voxels
+    del mask, fmri_data, design_matrices, model

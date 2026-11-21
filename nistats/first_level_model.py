@@ -27,7 +27,10 @@ from sklearn.base import (BaseEstimator,
 from sklearn.externals.joblib import Memory
 from nilearn.input_data import NiftiMasker
 from nilearn._utils import CacheMixin
-from nilearn._utils.niimg_conversions import check_niimg
+from nilearn._utils.niimg_conversions import (check_niimg,
+                                              _check_same_fov,
+                                              )
+from nilearn.image import crop_img, resample_img
 from sklearn.externals.joblib import (Parallel,
                                       delayed,
                                       )
@@ -163,6 +166,82 @@ def run_glm(Y, X, noise_model='ar1', bins=100, n_jobs=1, verbose=0):
     return labels, results
 
 
+def _prepare_block_extraction(run_img, mask_img, block_size):
+    """Prepare the block-wise extraction of the masked time series of a run.
+
+    Parameters
+    ----------
+    run_img : Nifti1Image
+        4D image of the run. May be proxy-backed: its data are not loaded
+        here (except when resampling is required, exactly as the standard
+        masking path does).
+
+    mask_img : Nifti1Image
+        3D mask as fitted by the model masker (``masker_.mask_img_``).
+
+    block_size : int
+        Maximum number of voxels processed per block.
+
+    Returns
+    -------
+    work_img : Nifti1Image
+        The image the blocks are extracted from. This is ``run_img``
+        itself when no resampling is needed; otherwise ``run_img``
+        resampled on the (cropped) mask grid, mirroring what
+        `NiftiMasker.transform` does internally. Doing it once per run
+        instead of once per block keeps smoothing identical to the
+        standard path and avoids resampling the data for every block.
+
+    blocks : list of arrays of int
+        Flat indices (C order, i.e. the masker column order) of the voxels
+        of each block, on the working mask grid.
+
+    mask_shape : tuple of int
+        Shape of the working mask grid.
+
+    mask_affine : array of shape (4, 4)
+        Affine of the working mask grid.
+
+    """
+    if not _check_same_fov(run_img, mask_img):
+        work_mask = crop_img(mask_img, copy=False)
+        work_img = resample_img(run_img, target_affine=work_mask.affine,
+                                target_shape=work_mask.shape,
+                                interpolation='continuous')
+    else:
+        work_mask, work_img = mask_img, run_img
+    mask_data = get_data(work_mask)
+    voxel_order = np.flatnonzero(np.asarray(mask_data).astype(bool).ravel())
+    n_blocks = int(np.ceil(voxel_order.size / float(block_size)))
+    blocks = np.array_split(voxel_order, max(n_blocks, 1))
+    return work_img, blocks, work_mask.shape, work_mask.affine
+
+
+def _block_mask_image(flat_indices, mask_shape, mask_affine):
+    """Build a 3D mask image holding only the voxels of one block."""
+    block_mask = np.zeros(mask_shape, dtype=np.int8)
+    block_mask.flat[flat_indices] = 1
+    return Nifti1Image(block_mask, mask_affine)
+
+
+def _merged_regression_results(theta, cov, dispersion, nuisance,
+                               df_total, df_model):
+    """Build a SimpleRegressionResults from merged per-block arrays.
+
+    Only the quantities required for contrast computation are stored; the
+    full data and residual matrices are never reconstructed.
+    """
+    results = SimpleRegressionResults.__new__(SimpleRegressionResults)
+    results.theta = theta
+    results.cov = cov
+    results.dispersion = dispersion
+    results.nuisance = nuisance
+    results.df_total = df_total
+    results.df_model = df_model
+    results.df_residuals = df_total - df_model
+    return results
+
+
 class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
     """ Implementation of the General Linear Model
     for single session fMRI data.
@@ -273,16 +352,61 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         This id will be used to identify a `FirstLevelModel` when passed to
         a `SecondLevelModel` object.
 
+    block_size : int or None, optional
+        If not None, the GLM of each run is fitted block by block over the
+        voxels of the mask, processing at most ``block_size`` voxels at a
+        time. This is meant for long 4D images whose full masked time
+        series does not fit in memory: the data are prepared through image
+        proxies and a bounded, block-level cache, so that at most one
+        block of masked time series (and its regression results) is held
+        in memory at any time. Coefficients, variance and AR labels of
+        every block are stored, and ``compute_contrast`` merges the
+        per-block results in full-mask order, without reconstructing the
+        full data matrix.
+
+        Preprocessing and scaling are identical to the standard path:
+
+        * ``smoothing_fwhm`` is supported. Smoothing is applied to the
+          whole volume before each block extraction, so the extracted
+          signals are exactly those of the standard path, at the cost of
+          one smoothing pass per block: with smoothing enabled, keep the
+          number of blocks moderate.
+        * ``signal_scaling`` 0 and (0, 1) are supported with the same
+          results as the standard path. (0, 1) requires a streaming
+          pre-pass over the blocks to compute the grand mean; setting
+          ``memory`` lets the second pass reuse the cached extractions.
+          ``signal_scaling=1`` is not supported, as in the standard path.
+
+        Block-wise fits always store minimized results, whatever
+        ``minimize_memory``: no full residual or data matrix is ever
+        kept, and the voxelwise attributes ``residuals``, ``predicted``
+        and ``r_square`` are not available. When ``memory`` is set,
+        extractions are cached on disk at block granularity; the cache
+        can be reclaimed with ``self.memory.clear()``, while block data
+        held in memory are released as soon as each block is fitted.
+        Defaults to None, meaning the whole mask is processed at once.
+
     Attributes
     ----------
     labels_ : array of shape (n_voxels,),
-        a map of values on voxels used to identify the corresponding model
+        a map of values on voxels used to identify the corresponding model.
+        Not set when the model is fitted block by block; see
+        ``block_results_``.
 
     results_ : dict,
         with keys corresponding to the different labels values.
         Values are SimpleRegressionResults corresponding to the voxels,
         if minimize_memory is True,
-        RegressionResults if minimize_memory is False
+        RegressionResults if minimize_memory is False.
+        Not set when the model is fitted block by block; see
+        ``block_results_``.
+
+    block_results_ : None or list of lists of tuples
+        Only set when ``block_size`` is not None: one entry per run, each
+        holding one ``(labels, results)`` tuple per voxel block, where
+        ``results`` maps each AR label to a SimpleRegressionResults
+        instance covering the voxels of the block. The per-block results
+        are merged in full-mask order by ``compute_contrast``.
 
 
     """
@@ -294,7 +418,7 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
                  target_affine=None, target_shape=None, smoothing_fwhm=None,
                  memory=Memory(None), memory_level=1, standardize=False,
                  signal_scaling=0, noise_model='ar1', verbose=0, n_jobs=1,
-                 minimize_memory=True, subject_label=None):
+                 minimize_memory=True, subject_label=None, block_size=None):
         # design matrix parameters
         self.t_r = t_r
         self.slice_time_ref = slice_time_ref
@@ -325,6 +449,20 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             raise ValueError('signal_scaling must be "False", "0", "1"'
                              ' or "(0, 1)"')
 
+        if block_size is not None:
+            if (not isinstance(block_size, (int, np.integer))
+                    or isinstance(block_size, bool) or block_size < 1):
+                raise ValueError('block_size must be None or a positive '
+                                 'integer, got %s' % (block_size,))
+            if self.signal_scaling and self.scaling_axis == 1:
+                raise ValueError('signal_scaling=1 (scaling each time '
+                                 'point by the mean over all voxels) is not '
+                                 'supported together with block_size; it '
+                                 'is not supported by the standard fitting '
+                                 'path either. Use signal_scaling=0 or '
+                                 '(0, 1).')
+        self.block_size = block_size
+
         self.noise_model = noise_model
         self.verbose = verbose
         self.n_jobs = n_jobs
@@ -332,6 +470,7 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         # attributes
         self.labels_ = None
         self.results_ = None
+        self.block_results_ = None
         self.subject_label = subject_label
 
     def fit(self, run_imgs, events=None, confounds=None,
@@ -342,6 +481,10 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         1. create design matrix X
         2. do a masker job: fMRI_data -> Y
         3. fit regression to (Y, X)
+
+        If ``block_size`` is not None, steps 2 and 3 are carried out block
+        by block over the voxels of the mask, so that at most
+        ``block_size`` voxel time series are held in memory at any time.
 
         Parameters
         ----------
@@ -431,6 +574,11 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
 
         # For each run fit the model and keep only the regression results.
         self.labels_, self.results_, self.design_matrices_ = [], [], []
+        self.block_results_ = [] if self.block_size is not None else None
+        if self.block_size is not None and not self.minimize_memory:
+            warn('block-wise fitting (block_size is not None) always '
+                 'stores minimized results: minimize_memory=False is '
+                 'ignored and no full residual matrix is kept.')
         n_runs = len(run_imgs)
         t0 = time.time()
         for run_idx, run_img in enumerate(run_imgs):
@@ -453,7 +601,9 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             # Build the experimental design for the glm
             run_img = check_niimg(run_img, ensure_ndim=4)
             if design_matrices is None:
-                n_scans = get_data(run_img).shape[3]
+                # n_scans is read from the image header, so that
+                # proxy-backed images are not loaded into memory
+                n_scans = run_img.shape[3]
                 if confounds is not None:
                     confounds_matrix = confounds[run_idx].values
                     if confounds_matrix.shape[0] != n_scans:
@@ -486,6 +636,14 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             if self.verbose > 1:
                 t_masking = time.time()
                 sys.stderr.write('Starting masker computation \r')
+
+            if self.block_size is not None:
+                # Voxel-block path for long 4D images: extract, scale and
+                # fit at most block_size voxels at a time, so the full
+                # masked time series is never held in memory.
+                self._glm_in_blocks(run_img, design)
+                del run_img  # Delete unmasked image to save memory
+                continue
 
             Y = self.masker_.transform(run_img)
             del run_img  # Delete unmasked image to save memory
@@ -528,6 +686,145 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
 
         return self
 
+    def _glm_in_blocks(self, run_img, design):
+        """Fit the GLM of one run block by block over the mask voxels.
+
+        At most ``self.block_size`` voxels are extracted, scaled and
+        fitted at a time, so the full masked time series of long 4D
+        images is never held in memory. Only the minimized per-block
+        results (coefficients, variance and AR labels) are kept, appended
+        to ``self.block_results_``.
+
+        Parameters
+        ----------
+        run_img : Nifti1Image
+            4D image of the run, possibly proxy-backed.
+
+        design : pandas DataFrame
+            The design matrix of the run.
+
+        """
+        work_img, blocks, mask_shape, mask_affine = \
+            _prepare_block_extraction(run_img, self.masker_.mask_img_,
+                                      self.block_size)
+        n_scans = design.values.shape[0]
+        if self.verbose > 1:
+            sys.stderr.write('Fitting GLM in %d blocks of at most %d '
+                             'voxels\n' % (len(blocks), self.block_size))
+
+        # Grand mean scaling needs statistics over all voxels: compute
+        # them in a streaming pre-pass that never holds the full data.
+        # When memory is set, the extractions of this pass are cached on
+        # disk and reused by the fitting pass below.
+        scaling_mean = None
+        if self.signal_scaling and self.scaling_axis == (0, 1):
+            data_sum = 0.
+            n_voxels = 0
+            for flat_indices in blocks:
+                Y_block = self._extract_block(work_img, flat_indices,
+                                              mask_shape, mask_affine)
+                data_sum += Y_block.sum()
+                n_voxels += Y_block.shape[1]
+                del Y_block
+            scaling_mean = data_sum / (n_scans * n_voxels)
+            if scaling_mean == 0:
+                warn('Mean values of 0 observed.'
+                     'The data have probably been centered.'
+                     'Scaling might not work as expected')
+            scaling_mean = max(scaling_mean, 1)
+
+        if self.memory:
+            mem_glm = self.memory.cache(run_glm, ignore=['n_jobs'])
+        else:
+            mem_glm = run_glm
+
+        run_results = []
+        for block_idx, flat_indices in enumerate(blocks):
+            if self.verbose > 1:
+                sys.stderr.write('Fitting block %d out of %d\r'
+                                 % (block_idx + 1, len(blocks)))
+            Y_block = self._extract_block(work_img, flat_indices,
+                                          mask_shape, mask_affine)
+            if self.signal_scaling:
+                if self.scaling_axis == 0:
+                    Y_block, _ = mean_scaling(Y_block, axis=0)
+                else:  # self.scaling_axis == (0, 1)
+                    Y_block = 100 * (Y_block / scaling_mean - 1)
+            labels, results = mem_glm(Y_block, design.values,
+                                      noise_model=self.noise_model,
+                                      bins=100, n_jobs=self.n_jobs)
+            # Block-wise fits always store minimized results: the full
+            # residual and data matrices are never kept in memory.
+            for key in results:
+                results[key] = SimpleRegressionResults(results[key])
+            run_results.append((labels, results))
+            del Y_block
+        self.block_results_.append(run_results)
+
+    def _extract_block(self, run_img, flat_indices, mask_shape, mask_affine):
+        """Extract the masked time series of a single block of voxels.
+
+        A dedicated NiftiMasker is fitted on a mask holding only the
+        voxels of the block, with the same preprocessing parameters as
+        the model masker, so the extracted signals are identical to the
+        corresponding columns of the full-mask transform.
+        """
+        block_mask = _block_mask_image(flat_indices, mask_shape,
+                                       mask_affine)
+        block_masker = NiftiMasker(mask_img=block_mask,
+                                   smoothing_fwhm=self.smoothing_fwhm,
+                                   standardize=self.standardize,
+                                   t_r=self.t_r,
+                                   memory=self.memory,
+                                   memory_level=self.memory_level,
+                                   verbose=max(0, self.verbose - 2))
+        block_masker.fit()
+        return block_masker.transform(run_img)
+
+    def _merge_block_results(self):
+        """Merge the per-block GLM results in full-mask order.
+
+        Blocks were fitted in the masker column order, so concatenating
+        the per-block arrays reproduces the full-mask order. The full
+        masked data matrix is never reconstructed.
+
+        Returns
+        -------
+        labels : list of arrays
+            One AR label array per run, in full-mask order.
+
+        results : list of dicts
+            One dict per run, mapping each AR label to a
+            SimpleRegressionResults covering all the voxels of the mask.
+
+        """
+        all_labels, all_results = [], []
+        for run_results in self.block_results_:
+            labels = np.concatenate([block_labels
+                                     for block_labels, _ in run_results])
+            results = {}
+            for val in np.unique(labels):
+                thetas, dispersions = [], []
+                cov = nuisance = df_total = df_model = None
+                for _, block_results in run_results:
+                    if val not in block_results:
+                        continue
+                    res = block_results[val]
+                    thetas.append(res.theta)
+                    dispersions.append(res.dispersion)
+                    cov, nuisance = res.cov, res.nuisance
+                    df_total, df_model = res.df_total, res.df_model
+                results[val] = _merged_regression_results(
+                    np.concatenate(thetas, axis=1),
+                    cov,
+                    np.concatenate(dispersions),
+                    nuisance,
+                    df_total,
+                    df_model)
+            all_labels.append(labels)
+            all_results.append(results)
+        return all_labels, all_results
+
     def compute_contrast(self, contrast_def, stat_type=None,
                          output_type='z_score'):
         """Generate different outputs corresponding to
@@ -561,8 +858,16 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
             The desired output image(s). If ``output_type == 'all'``, then
             the output is a dictionary of images, keyed by the type of image.
 
+        Notes
+        -----
+        When the model was fitted block by block (``block_size`` is not
+        None), the per-block coefficients, variances and AR labels are
+        merged in full-mask order before the contrast is computed; the
+        full masked data matrix is never reconstructed.
+
         """
-        if self.labels_ is None or self.results_ is None:
+        if self.block_results_ is None and (self.labels_ is None
+                                            or self.results_ is None):
             raise ValueError('The model has not been fit yet')
 
         if isinstance(contrast_def, (np.ndarray, str)):
@@ -582,7 +887,7 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
                 con_vals[cidx] = expression_to_contrast_vector(
                     con, design_columns)
 
-        n_runs = len(self.labels_)
+        n_runs = len(self.design_matrices_)
         if len(con_vals) != n_runs:
             warn('One contrast given, assuming it for all %d runs' % n_runs)
             con_vals = con_vals * n_runs
@@ -593,7 +898,13 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
         if output_type not in valid_types:
             raise ValueError(
                 'output_type must be one of {}'.format(valid_types))
-        contrast = _compute_fixed_effect_contrast(self.labels_, self.results_,
+        if self.block_results_ is not None:
+            # Merge the per-block results in full-mask order, without
+            # reconstructing the full masked data matrix.
+            labels, results = self._merge_block_results()
+        else:
+            labels, results = self.labels_, self.results_
+        contrast = _compute_fixed_effect_contrast(labels, results,
                                                   con_vals, stat_type)
         output_types = (valid_types[:-1]
                         if output_type == 'all' else [output_type])
@@ -642,6 +953,13 @@ class FirstLevelModel(BaseEstimator, TransformerMixin, CacheMixin):
                    "{attr}".format(attr=possible_attributes)
                    )
             raise ValueError(msg)
+
+        if self.block_results_ is not None:
+            raise ValueError(
+                'Voxelwise attributes like R-squared, residuals, and '
+                'predictions are not available when the model is fitted '
+                'block by block (block_size is not None): the full '
+                'residual and data matrices are never stored.')
 
         if self.minimize_memory:
             raise ValueError(
@@ -730,7 +1048,8 @@ def first_level_models_from_bids(dataset_path, task_label, space_label=None,
                                  signal_scaling=0, noise_model='ar1',
                                  verbose=0, n_jobs=1,
                                  minimize_memory=True,
-                                 derivatives_folder='derivatives'):
+                                 derivatives_folder='derivatives',
+                                 block_size=None):
     """Create FirstLevelModel objects and fit arguments from a BIDS dataset.
 
     It t_r is not specified this function will attempt to load it from a
@@ -883,7 +1202,8 @@ def first_level_models_from_bids(dataset_path, task_label, space_label=None,
             memory_level=memory_level, standardize=standardize,
             signal_scaling=signal_scaling, noise_model=noise_model,
             verbose=verbose, n_jobs=n_jobs,
-            minimize_memory=minimize_memory, subject_label=sub_label)
+            minimize_memory=minimize_memory, subject_label=sub_label,
+            block_size=block_size)
         models.append(model)
 
         # Get preprocessed imgs
